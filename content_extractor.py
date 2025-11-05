@@ -1,7 +1,7 @@
 import asyncio
 import os
-import sys
-from urllib.parse import urlparse, urlunparse
+import json
+import hashlib
 from playwright.async_api import async_playwright, Playwright
 
 # --- Configuration ---
@@ -24,35 +24,27 @@ def load_links_from_file(filename=LINKS_FILE):
     return list(urls)
 
 def get_safe_filename(url):
-    """Converts a URL into a safe, unique filename."""
-    try:
-        parsed_url = urlparse(url)
-        # Combine netloc (domain) and path
-        base_name = parsed_url.netloc + parsed_url.path
-        
-        # Replace non-alphanumeric characters with underscores for safety
-        safe_name = ''.join(c if c.isalnum() or c in '._-' else '_' for c in base_name)
-        # Ensure it doesn't end with a trailing underscore if path was just '/'
-        return f"{safe_name.strip('_')}.txt"
-    except Exception:
-        # Fallback for very malformed URLs
-        return f"malformed_link_{hash(url)}.txt"
+    """Generates a safe, unique filename based on the URL hash (as per your original design)."""
+    url_hash = hashlib.sha256(url.encode('utf-8')).hexdigest()
+    # Use the first 10 characters of the hash as the unique filename
+    return os.path.join(OUTPUT_DIR, f"{url_hash[:10]}.json")
 
 async def worker(p: Playwright, url: str):
     """
-    The concurrent unit of work: visits URL, extracts content, and saves it to a file.
+    The concurrent unit of work: visits URL, extracts content, and saves it as a JSON file.
     """
     # Use the semaphore to limit concurrency
     async with semaphore:
         browser = None
-        output_filepath = os.path.join(OUTPUT_DIR, get_safe_filename(url))
+        output_filepath = get_safe_filename(url)
 
         # Check if the file already exists to avoid re-crawling
         if os.path.exists(output_filepath):
-            print(f"  [SKIP] File already exists for {url}. Path: {output_filepath}")
+            print(f"  [SKIP] File already exists for {url}. Path: {os.path.basename(output_filepath)}")
             return
 
         try:
+            # Launch browser instance
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context()
             page = await context.new_page()
@@ -63,24 +55,27 @@ async def worker(p: Playwright, url: str):
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             
             title = await page.title()
-            # Extract content from the body, excluding scripts/styles
             body_content = await page.locator("body").inner_text()
             
-            # 2. Prepare content for file storage
-            file_content = f"--- URL: {url}\n"
-            file_content += f"--- TITLE: {title}\n"
-            file_content += f"--- CONTENT START ---\n"
-            file_content += body_content
+            # 2. Prepare data for JSON output
+            data = {
+                "url": url,
+                "page_title": title,
+                "full_content": body_content, # Storing full content for later cleaning
+                "full_content_length": len(body_content),
+                # Storing a snippet for quick debugging/review
+                "page_content_snippet": body_content[:500] + "..." if len(body_content) > 500 else body_content,
+            }
             
-            # 3. Save to file
+            # 3. Save to JSON file
             with open(output_filepath, 'w', encoding='utf-8') as f:
-                f.write(file_content)
+                json.dump(data, f, indent=4, ensure_ascii=False)
                 
-            print(f"  [SAVED] Content extracted and saved: {output_filepath}")
+            print(f"  [SAVED] Content extracted and saved: {os.path.basename(output_filepath)}")
             
         except Exception as e:
-            # Handle navigation/extraction errors (e.g., 404s, timeouts)
-            print(f"  [ERROR] Failed to load/save {url}: {e}")
+            # Handle navigation/extraction errors
+            print(f"  [ERROR] Failed to process {url}: {e}")
         finally:
             if browser:
                 await browser.close()
@@ -97,8 +92,8 @@ async def extract_content():
         print("Exiting extraction: No links to process.")
         return
 
-    print(f"\n--- STARTING CONTENT EXTRACTION ({len(urls_to_process)} links) ---")
-    print(f"Outputting files to directory: {OUTPUT_DIR}")
+    print(f"\n--- STARTING CONCURRENT CONTENT EXTRACTION ({len(urls_to_process)} links) ---")
+    print(f"Outputting JSON files to directory: {OUTPUT_DIR}")
     
     async with async_playwright() as p:
         
@@ -113,6 +108,7 @@ async def extract_content():
 
 if __name__ == "__main__":
     try:
+        # You need to run the main async function
         asyncio.run(extract_content())
     except KeyboardInterrupt:
         print("\nProcess interrupted by user.")
