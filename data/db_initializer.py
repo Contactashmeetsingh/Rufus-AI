@@ -4,7 +4,9 @@ import sys
 import chromadb
 from playwright.async_api import async_playwright, Playwright
 from semantic_storage import store_content_and_embed, CHROMA_CLIENT, CRAWL_COLLECTION
+from embedding_client import close_session # <-- NEW IMPORT
 from urllib.parse import urljoin, urlparse
+from dotenv import load_dotenv # <-- NEW IMPORT
 
 # --- Globals ---
 # Limit the number of concurrent browser page accesses
@@ -57,7 +59,7 @@ async def worker(p: Playwright, url: str):
         try:
             # We skip URLs already processed and stored in Chroma
             if CRAWL_COLLECTION.get(ids=[url], include=[])['ids']:
-                print(f"  [SKIP] {url} already in DB.")
+                print(f"  [SKIP] {url} already in DB.")
                 return
 
             browser = await p.chromium.launch(headless=True)
@@ -77,7 +79,7 @@ async def worker(p: Playwright, url: str):
             
         except Exception as e:
             # Handle navigation/extraction errors (e.g., 404s, timeouts)
-            print(f"  [ERROR] Failed to load/embed {url}: {e}")
+            print(f"  [ERROR] Failed to load/embed {url}: {e}")
         finally:
             if browser:
                 await browser.close()
@@ -85,6 +87,8 @@ async def worker(p: Playwright, url: str):
 
 async def populate_db():
     """Reads links and runs concurrent workers to populate Chroma."""
+    
+    load_dotenv() # <-- NEW: Load the .env file here for API key access
     
     # --- PHASE 0: SETUP ---
     initial_count = init_vector_db()
@@ -103,7 +107,6 @@ async def populate_db():
         tasks = [worker(p, url) for url in urls_to_process]
         
         # Run all tasks concurrently and wait for them all to complete
-        # Running a single large batch is efficient for this specific step
         await asyncio.gather(*tasks)
             
     final_count = CRAWL_COLLECTION.count() if CRAWL_COLLECTION else 0
@@ -112,6 +115,9 @@ async def populate_db():
     print(f"\n--- DB POPULATION COMPLETE ---")
     print(f"Documents added in this run: {new_docs}")
     print(f"Total documents now stored in Chroma: {final_count}")
+    
+    # Clean up the aiohttp session
+    await close_session() # <-- NEW: Close the session
 
 
 if __name__ == "__main__":

@@ -1,83 +1,127 @@
-import asyncio
 import chromadb
-from embedding_client import get_embedding 
+from typing import List, Dict, Optional
+from embedding_client import get_embedding # Import the async embedding client
+import uuid
 
-# Global Chroma variables, initialized externally by db_initializer.py
-CHROMA_CLIENT = None
-CRAWL_COLLECTION = None
+# --- Globals ---
+CHROMA_CLIENT: Optional[chromadb.Client] = None
+CRAWL_COLLECTION: Optional[chromadb.Collection] = None
 
-async def store_content_and_embed(url, title, content):
-    """Generates an embedding and stores the document in the Chroma collection."""
-    global CRAWL_COLLECTION
-    if not CRAWL_COLLECTION:
-        print("Error: Chroma collection not initialized.")
-        return False
+# --- Configuration ---
+CHUNK_SIZE = 1000 
+CHUNK_OVERLAP = 200 # Overlap to maintain context between chunks
+
+def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
+    """
+    Splits a large text block into overlapping chunks for better embedding context.
+    """
+    if not text or len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    start = 0
     
-    # Check if the document (URL) already exists using the URL as the unique ID
-    # Note: Chroma's get returns results structure even if empty, check 'ids' key.
-    if CRAWL_COLLECTION.get(ids=[url], include=[])['ids']:
-        # This check is fast for pre-filtering
-        print(f"  [STORAGE] Content for {url} already processed (found in Chroma).")
-        return True
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        chunks.append(chunk)
+        
+        # Determine the next starting point, accounting for overlap
+        start += (chunk_size - overlap)
+        if start >= len(text) - overlap:
+             # Ensure the last chunk includes the end of the text
+             if len(text) - chunk_size > 0 and len(chunks[-1]) != len(text[len(text) - chunk_size:]):
+                 chunks.append(text[len(text) - chunk_size:])
+             break
 
-    # Limit text to 1000 characters for embedding, combining title and content
-    text_to_embed = f"{title}. {content[:1000]}"
-    vector = await get_embedding(text_to_embed)
+    # Clean up empty strings or duplicates resulting from edge cases
+    return list(set([c.strip() for c in chunks if c.strip()]))
+
+
+async def store_content_and_embed(url: str, title: str, content: str):
+    """
+    Chunks the content, gets embeddings for each chunk asynchronously, and stores 
+    the data and vectors in the Chroma collection.
+    """
+    if CRAWL_COLLECTION is None:
+        print("ERROR: Chroma collection not initialized. Cannot store content.")
+        return
+
+    chunks = chunk_text(content, CHUNK_SIZE, CHUNK_OVERLAP)
     
-    if vector:
-        try:
-            # Chroma add operation
-            CRAWL_COLLECTION.add(
-                embeddings=[vector],
-                documents=[content],
-                metadatas=[{"url": url, "title": title}],
-                ids=[url] # URL acts as the unique identifier
-            )
-            print(f"  [STORED] Document embedded and stored in Chroma: {url}")
-            return True
-        except Exception as e:
-            print(f"  [ERROR] Chroma insertion failed for {url}: {e}")
-            return False
+    print(f"  [STORE] Chunking complete. Generated {len(chunks)} chunks for {url}")
+    
+    document_ids = []
+    documents = []
+    metadatas = []
+    vectors = []
+    
+    for i, chunk in enumerate(chunks):
+        # AWAIT the asynchronous embedding call
+        vector = await get_embedding(chunk) 
+
+        if vector is None:
+            print(f"  [FAIL] Skipping chunk {i+1} due to missing embedding vector.")
+            continue
             
-    return False
+        # Create a unique ID for this chunk
+        chunk_id = f"{url}_{uuid.uuid4()}"
+        
+        document_ids.append(chunk_id)
+        documents.append(chunk)
+        vectors.append(vector)
+        
+        # Store metadata linking the chunk back to the source document
+        metadatas.append({
+            "source_url": url,
+            "title": title,
+            "chunk_index": i
+        })
 
-async def semantic_search(query, top_k=5):
+    if document_ids:
+        # Batch insert into the Chroma collection
+        CRAWL_COLLECTION.add(
+            ids=document_ids,
+            embeddings=vectors,
+            documents=documents,
+            metadatas=metadatas
+        )
+        print(f"  [SUCCESS] Stored {len(document_ids)} chunks for {url} in ChromaDB.")
+    else:
+        print(f"  [FAIL] No valid chunks were generated or stored for {url}.")
+        
+
+async def semantic_search(query: str, top_k: int = 5) -> List[Dict]:
     """
-    Performs semantic search by embedding the query and querying the Chroma collection.
+    Performs a semantic search against the vector database using the query's embedding.
     """
-    global CRAWL_COLLECTION
-    if not CRAWL_COLLECTION or CRAWL_COLLECTION.count() == 0:
-        print("Chroma collection is empty or not initialized.")
+    if CRAWL_COLLECTION is None:
+        print("ERROR: Chroma collection not initialized. Cannot search.")
         return []
 
-    # 1. Get the embedding for the user's query
+    # Get the embedding vector for the user's query
     query_vector = await get_embedding(query)
     
-    if not query_vector:
-        print("Could not generate vector for query.")
+    if query_vector is None:
+        print("ERROR: Could not generate embedding for query.")
         return []
-
-    # 2. Query the Chroma collection
-    # Chroma handles the vector search (similarity/distance calculation)
+        
+    # Query the Chroma collection
     results = CRAWL_COLLECTION.query(
         query_embeddings=[query_vector],
         n_results=top_k,
-        include=['metadatas', 'distances'] 
+        include=['metadatas', 'documents', 'distances'] # Also get the distance/score
     )
 
-    # 3. Format the results
+    # Format the results into a cleaner list of dictionaries
     formatted_results = []
-    
-    if results and results['metadatas'] and results['distances']:
-        for metadata, distance in zip(results['metadatas'][0], results['distances'][0]):
-            # L2 distance: lower distance means higher similarity.
+    if results and results['ids'] and results['ids'][0]:
+        for i in range(len(results['ids'][0])):
             formatted_results.append({
-                "url": metadata.get("url", "N/A"),
-                "title": metadata.get("title", "N/A"),
-                "proximity_score": distance 
+                "proximity_score": results['distances'][0][i],
+                "url": results['metadatas'][0][i]['source_url'],
+                "title": results['metadatas'][0][i]['title'],
+                "content_chunk": results['documents'][0][i]
             })
             
-    # Sort by the distance (ascending)
-    formatted_results.sort(key=lambda x: x["proximity_score"], reverse=False)
-    
     return formatted_results
