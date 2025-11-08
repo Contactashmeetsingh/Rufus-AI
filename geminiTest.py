@@ -1,5 +1,7 @@
 # Command to run this program
 # GEMINI_API_KEY=AIzaSyCaedega5CfHeWDkd1yQKeR7SHEdFHZKHY python geminiTest.py
+# python -m pip install google-genai
+# This will install package needed, might be different based on how environment is setup
 import os
 import json
 from google import genai
@@ -10,6 +12,7 @@ from google.genai import types
 # Get a key from the Google AI Studio: https://aistudio.google.com/apikey
 MODEL_NAME = "gemini-2.5-flash"
 MEMORY_FILE = 'results7.json'
+#Results7.json is a local file, will push a proper updated file to github in a few days
 
 import os
 import json
@@ -117,4 +120,5 @@ def run_chatbot():
             break
 
 if __name__ == "__main__":
+
     run_chatbot()
